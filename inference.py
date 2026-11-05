@@ -1,261 +1,209 @@
-# inference.py
+"""
+NEXA-SLM: Master Inference and Generation Pipeline
+Supports:
+- High-efficiency cached autoregressive decoding with O(W + m) constant-size KV cache
+- Mamba-3 recurrent state caching
+- Temperature, Top-K, and Top-P (nucleus) sampling
+- Optional INT8 dynamic quantization for edge deployment
+- Latency and throughput benchmarking
+"""
 
 import os
-import math
+import sys
+import time
+import argparse
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+from typing import Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from train import Config, PerfectSLM, Mamba3Layer, SWGQA, apply_rotary_emb
 from transformers import PreTrainedTokenizerFast
 
-# ---------------------------------------------------------
-# 1. ADD `step` METHODS FOR AUTOREGRESSIVE CACHING
-# ---------------------------------------------------------
+# Import components from nexa
+from nexa.config import (
+    NexaConfig,
+    Config,
+    get_unit_test_config,
+    get_dev_config,
+    get_base_config,
+    get_poc_config,
+)
+from nexa.model import NexaSLM, PerfectSLM, SuperBlock
+from nexa.mamba3 import Mamba3Layer
+from nexa.attention import SWGQA, apply_rotary_emb
+from nexa.inference import generate, inference_step, sample_next_token
+from nexa.quantization import quantize_model_int8, profile_inference_speed
 
-def mamba_step(self, x, cache, block_idx, layer_idx):
+
+# Legacy alias for sampling
+def sample(logits: torch.Tensor, temperature: float = 1.0, top_k: Optional[int] = None) -> int:
+    return sample_next_token(logits, temperature=temperature, top_k=top_k)
+
+
+# Monkey-patch step methods for legacy imports if needed
+mamba_step = Mamba3Layer.step
+swgqa_step = SWGQA.step
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="NEXA-SLM Text Generation and Inference")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="base",
+        choices=["poc", "base", "dev", "test"],
+        help="Model configuration preset",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Path to trained checkpoint (.pt file)",
+    )
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default="In the era of artificial intelligence, small language models",
+        help="Prompt text for generation",
+    )
+    parser.add_argument(
+        "--tokenizer",
+        type=str,
+        default="jamba_bbpe_tokenizer.json",
+        help="Path to tokenizer JSON file",
+    )
+    parser.add_argument("--max_tokens", type=int, default=50, help="Maximum new tokens to generate")
+    parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
+    parser.add_argument("--top_k", type=int, default=40, help="Top-K sampling cutoff")
+    parser.add_argument("--top_p", type=float, default=0.9, help="Top-P nucleus sampling threshold")
+    parser.add_argument("--device", type=str, default=None, help="Execution device (cuda/cpu)")
+    parser.add_argument("--quantize_int8", action="store_true", help="Apply dynamic INT8 quantization")
+    parser.add_argument("--benchmark", action="store_true", help="Run speed and latency benchmark")
+    return parser.parse_args()
+
+
+def load_model_for_inference(
+    config: NexaConfig,
+    checkpoint_path: Optional[str] = None,
+    device: str = "cpu",
+    quantize_int8: bool = False,
+) -> Tuple[NexaSLM, bool]:
     """
-    Single-token step for Mamba3Layer with state caching.
-    x: (B, 1, D)
+    Constructs model, loads checkpoint if available, and applies optional INT8 quantization.
+    Returns (model, is_trained).
     """
-    B, L, D = x.shape
-    conv_key = f"mamba_{block_idx}_{layer_idx}_conv"
-    ssm_key = f"mamba_{block_idx}_{layer_idx}_ssm"
-
-    conv_state = cache.get(conv_key)
-    ssm_state = cache.get(ssm_key)
-    
-    if conv_state is None:
-        conv_state = torch.zeros(B, self.d_inner, self.conv1d.kernel_size[0] - 1,
-                                 device=x.device, dtype=x.dtype)
-        ssm_state = torch.zeros(B, self.d_inner, self.d_state,
-                                device=x.device, dtype=x.dtype)
-
-    # In-projection
-    xz = self.in_proj(x)                         # (B, 1, 2*d_inner)
-    x_in, z = torch.split(xz, self.d_inner, dim=-1)
-
-    # 1. Update 1D Conv state & apply convolution (CRITICAL: added bias)
-    conv_state = torch.cat([conv_state, x_in.transpose(1, 2)], dim=-1)
-    x_conv = F.conv1d(conv_state, self.conv1d.weight, bias=self.conv1d.bias,
-                      groups=self.conv1d.groups, padding=0)
-    x_conv = x_conv.squeeze(-1)                  # (B, d_inner)
-    x_conv = F.silu(x_conv)
-
-    # 2. State-Space Projections
-    dt_rank = self.dt_proj.in_features
-    x_dbl = self.x_proj(x_conv.unsqueeze(1))     # (B, 1, dt_rank + 2*d_state)
-    dt, B_proj, C_proj = torch.split(x_dbl, [dt_rank, self.d_state, self.d_state], dim=-1)
-    
-    dt = F.softplus(self.dt_proj(dt)).squeeze(1) # (B, d_inner)
-    B_proj = B_proj.squeeze(1)                   # (B, d_state)
-    C_proj = C_proj.squeeze(1)                   # (B, d_state)
-
-    # 3. Discretization & SSM State Update
-    A = -torch.exp(self.A_log)                   # (d_inner, d_state)
-    dA = torch.exp(dt.unsqueeze(-1) * A)         # (B, d_inner, d_state)
-    dB = dt.unsqueeze(-1) * B_proj.unsqueeze(1)  # (B, d_inner, d_state)
-    
-    u = x_conv.unsqueeze(-1)                     # (B, d_inner, 1)
-    ssm_state = ssm_state * dA + dB * u          # (B, d_inner, d_state)
-
-    # 4. Output Projection (FIXED EINSUM STRING)
-    y = torch.einsum('bs,bds->bd', C_proj, ssm_state) + self.D * x_conv
-    y = y * F.silu(z.squeeze(1))                 
-    out = self.out_proj(y.unsqueeze(1))          # (B, 1, D)
-
-    # Trim conv_state to maintain rolling window
-    conv_state = conv_state[:, :, -(self.conv1d.kernel_size[0] - 1):]
-    
-    cache[conv_key] = conv_state
-    cache[ssm_key] = ssm_state
-    
-    return out, cache
-
-def swgqa_step(self, x, cache, block_idx, layer_idx):
-    """
-    Single-token step for SWGQA with O(1) pruned KV caching.
-    x: (B, 1, D)
-    """
-    B, L, D = x.shape
-    pos_key = f"pos_{block_idx}_{layer_idx}"
-    pos = cache.get(pos_key, 0)
-
-    # Project Q, K, V for current token
-    q = self.q_proj(x).view(B, L, self.q_heads, self.head_dim).transpose(1, 2)
-    k = self.k_proj(x).view(B, L, self.kv_heads, self.head_dim).transpose(1, 2)
-    v = self.v_proj(x).view(B, L, self.kv_heads, self.head_dim).transpose(1, 2)
-
-    # Apply RoPE mapped to the absolute sequence position
-    q_rot, k_rot = apply_rotary_emb(q, k,
-                                    self.freqs_cos[pos:pos+1],
-                                    self.freqs_sin[pos:pos+1])
-
-    k_key = f"swgqa_{block_idx}_{layer_idx}_k"
-    v_key = f"swgqa_{block_idx}_{layer_idx}_v"
-    
-    k_cache = cache.get(k_key, [])
-    v_cache = cache.get(v_key, [])
-    
-    k_cache.append(k_rot)
-    v_cache.append(v)
-    
-    # MEMORY OPTIMIZATION: Prune oldest non-scratchpad token out of the window
-    if len(k_cache) > self.num_scratchpad + self.window_size:
-        k_cache.pop(self.num_scratchpad) # Index 256 represents the oldest sliding window token
-        v_cache.pop(self.num_scratchpad)
-        
-    cache[k_key] = k_cache
-    cache[v_key] = v_cache
-    cache[pos_key] = pos + 1
-
-    # Concatenate active KVs (O(1) complexity since size is capped at 512 tokens)
-    keys = torch.cat(k_cache, dim=2)
-    vals = torch.cat(v_cache, dim=2)
-
-    # GQA Repetition
-    keys = keys.repeat_interleave(self.q_heads // self.kv_heads, dim=1)
-    vals = vals.repeat_interleave(self.q_heads // self.kv_heads, dim=1)
-
-    # Calculate Attention (No mask needed since pruning handles eviction inherently)
-    scores = torch.matmul(q_rot, keys.transpose(-2, -1)) / math.sqrt(self.head_dim)
-    attn = F.softmax(scores, dim=-1)
-    
-    out = torch.matmul(attn, vals).transpose(1, 2).contiguous().view(B, 1, -1)
-    return self.o_proj(out), cache
-
-# Monkey-patch inference steps into class definitions
-Mamba3Layer.step = mamba_step
-SWGQA.step = swgqa_step
-
-
-# ---------------------------------------------------------
-# 2. INFERENCE LOGIC & SAMPLING
-# ---------------------------------------------------------
-
-def inference_step(model, hidden, cache):
-    """Passes a single token (B, 1, D) through all architectural layers."""
-    for block_idx, block in enumerate(model.blocks):
-        for layer_idx, layer in enumerate(block.layers):
-            
-            if layer_idx == 2:  # SWGQA + Shared MLP
-                x_norm = layer['norm1'](hidden)
-                attn_out, cache = layer['attn'].step(x_norm, cache, block_idx, layer_idx)
-                hidden = hidden + attn_out
-                
-                x_norm2 = layer['norm2'](hidden)
-                mlp_out = layer['shared_mlp'](x_norm2)
-                hidden = hidden + mlp_out
-                
-            else:               # Mamba + MoE
-                x_norm = layer['norm1'](hidden)
-                mamba_out, cache = layer['mamba'].step(x_norm, cache, block_idx, layer_idx)
-                hidden = hidden + mamba_out
-                
-                x_norm2 = layer['norm2'](hidden)
-                moe_out, _, _ = layer['moe'](x_norm2) 
-                hidden = hidden + moe_out
-
-    return model.norm(hidden), cache
-
-def sample(logits, temperature=1.0, top_k=None):
-    """1D Sampling logic."""
-    logits = logits[0, -1, :] # Flatten from (1, 1, Vocab) to (Vocab,)
-    
-    if temperature < 1e-5:
-        return torch.argmax(logits, dim=-1).item()
-        
-    probs = F.softmax(logits / temperature, dim=-1)
-    
-    if top_k is not None:
-        values, indices = torch.topk(probs, top_k, dim=-1)
-        probs = torch.zeros_like(probs).scatter_(-1, indices, values)
-        probs = probs / probs.sum(dim=-1, keepdim=True)
-        
-    return torch.multinomial(probs, 1).item()
-
-@torch.no_grad()
-def generate(model, prompt_tokens, max_new_tokens=50, device='cpu', temperature=0.7, top_k=40):
-    model.eval()
-    model.to(device)
-    
-    cache = {}
-    
-    # 1. Pre-fill the Virtual Scratchpad
-    for i in range(model.config.num_scratchpad):
-        token_emb = model.scratchpad[i].view(1, 1, -1).to(device)
-        _, cache = inference_step(model, token_emb, cache)
-
-    # 2. Pre-fill the Actual Prompt
-    generated = prompt_tokens.copy()
-    for idx, token_id in enumerate(prompt_tokens):
-        tok_tensor = torch.tensor([[token_id]], device=device)
-        token_emb = model.embedding(tok_tensor)
-        
-        hidden, cache = inference_step(model, token_emb, cache)
-        
-        # Capture logits on the very last prompt token to begin generation
-        if idx == len(prompt_tokens) - 1:
-            logits = model.lm_head(hidden)
-            next_token = sample(logits, temperature, top_k)
-            generated.append(next_token)
-
-    # 3. Autoregressive Decoding Loop
-    for _ in range(max_new_tokens - 1):
-        tok_tensor = torch.tensor([[generated[-1]]], device=device)
-        token_emb = model.embedding(tok_tensor)
-        
-        hidden, cache = inference_step(model, token_emb, cache)
-        logits = model.lm_head(hidden)
-        
-        next_token = sample(logits, temperature, top_k)
-        generated.append(next_token)
-        
-        if next_token == 0:  # Assumes 0 is EOS token ID
-            break
-
-    return generated
-
-# ---------------------------------------------------------
-# 3. EXECUTION
-# ---------------------------------------------------------
-if __name__ == "__main__":
-    from transformers import AutoTokenizer # <-- Added Tokenizer
-    
-    config = Config()
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
     model = PerfectSLM(config)
-    
-    # Load Checkpoint
-    ckpt_path = config.resume_from_checkpoint 
-    if ckpt_path and os.path.exists(ckpt_path):
-        print(f"Loading checkpoint from {ckpt_path}...")
-        checkpoint = torch.load(ckpt_path, map_location='cpu')
-        model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+    is_trained = False
+
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        print(f"Loading checkpoint from: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
+        model.load_state_dict(state_dict, strict=True)
+        is_trained = True
+        step = checkpoint.get("global_step", "N/A")
+        loss = checkpoint.get("best_val_loss", "N/A")
+        print(f"Checkpoint loaded successfully! (Global Step: {step}, Best Val Loss: {loss})")
     else:
-        print("Warning: No checkpoint found, generating with random weights.")
+        if checkpoint_path:
+            print(f"Warning: Checkpoint '{checkpoint_path}' not found.")
+        print("[NOTICE: Generating with initialized (untrained) weights for architecture validation]")
 
-    model.lm_head.weight = model.embedding.weight  # Enforce weight tying
+    # Ensure tied weights
+    if config.tie_embeddings:
+        model.lm_head.weight = model.embedding.weight
 
-    # --- TOKENIZER SETUP ---
-    # Put the exact tokenizer name you used to build your .bin files here!
-    tokenizer_name = "jamba_bbpe_tokenizer.json" 
-    tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_name)
+    if quantize_int8:
+        print("Applying INT8 weight-only quantization to linear layers...")
+        model = quantize_model_int8(model)
 
-    # --- PROMPTS ---
-    prompt_text = "There was a boy named Om who"
-    
-    print(f"\nPrompt: '{prompt_text}'")
-    print(f"Generating on {device}...")
-    
-    # Convert text to tokens
-    prompt_tokens = tokenizer.encode(prompt_text, add_special_tokens=False)
-    
-    # Generate 15 next tokens
-    output_tokens = generate(model, prompt_tokens, max_new_tokens=200, device=device, temperature=0.3, top_k=40)
-    
-    # Convert tokens back to text
+    model.to(device)
+    model.eval()
+    return model, is_trained
+
+
+def main():
+    args = parse_args()
+
+    # Determine device
+    if args.device is not None:
+        device = args.device
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Select configuration
+    if args.config == "poc":
+        config = get_poc_config()
+    elif args.config == "dev":
+        config = get_dev_config()
+    elif args.config == "test":
+        config = get_unit_test_config()
+    else:
+        config = get_base_config()
+
+    print("=" * 70)
+    print(f"  NEXA-SLM Inference Engine")
+    print(f"  Preset: {args.config.upper()} | Device: {device} | INT8: {args.quantize_int8}")
+    print("=" * 70)
+
+    # Load tokenizer
+    if not os.path.exists(args.tokenizer):
+        # Check if parts exist to assemble
+        from scripts import assemble_tokenizer
+        print("Assembling tokenizer from parts...")
+
+    tokenizer = PreTrainedTokenizerFast(tokenizer_file=args.tokenizer)
+    print(f"Tokenizer loaded: {args.tokenizer} (Vocab: {len(tokenizer):,})")
+
+    # Load model
+    model, is_trained = load_model_for_inference(
+        config=config,
+        checkpoint_path=args.checkpoint,
+        device=device,
+        quantize_int8=args.quantize_int8,
+    )
+
+    if args.benchmark:
+        print("\n--- Running Inference Speed Benchmark ---")
+        perf = profile_inference_speed(
+            model, prompt_length=16, num_new_tokens=args.max_tokens, device=device
+        )
+        print(f"Throughput:       {perf['tokens_per_sec']} tokens/sec")
+        print(f"Latency / Token:  {perf['latency_per_token_ms']} ms")
+        print(f"Total Time:       {perf['total_time_sec']} s ({perf['generated_tokens']} tokens)")
+        print("------------------------------------------")
+
+    # Encode prompt
+    print(f"\nPrompt: '{args.prompt}'")
+    prompt_tokens = tokenizer.encode(args.prompt, add_special_tokens=False)
+    if len(prompt_tokens) == 0:
+        prompt_tokens = [1]  # Fallback to pad/bos
+
+    start_t = time.perf_counter()
+    output_tokens = generate(
+        model=model,
+        prompt_tokens=prompt_tokens,
+        max_new_tokens=args.max_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        top_p=args.top_p,
+        device=device,
+    )
+    gen_time = time.perf_counter() - start_t
+
+    new_tokens_count = len(output_tokens) - len(prompt_tokens)
+    tps = new_tokens_count / max(1e-6, gen_time)
+
     generated_text = tokenizer.decode(output_tokens)
-    print("\n--- Final Output ---")
+    print("\n--- Final Generated Output ---")
     print(generated_text)
-    print("--------------------")
+    print("------------------------------")
+    print(f"Generated {new_tokens_count} tokens in {gen_time:.3f}s ({tps:.1f} tokens/sec)")
+    if not is_trained:
+        print("[Note: Output generated from initialized architecture weights. Train model on text corpus for coherent text.]")
+
+
+if __name__ == "__main__":
+    main()

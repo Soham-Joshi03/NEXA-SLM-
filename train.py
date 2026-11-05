@@ -1,462 +1,396 @@
+"""
+NEXA-SLM: Master Training Pipeline
+Supports:
+- Multi-GPU & single-GPU / CPU training via Accelerate
+- Research POC (300-400M), Base (148M), Dev (41M), and Unit-Test (3.2M) configurations
+- Mamba-3 trapezoidal selective scan & SW-GQA with Scratchpad
+- MoE with Top-2 routing, shared expert, router z-loss, and load-balancing aux loss
+- Cosine LR scheduling with verified min_lr floor
+- Safe single-file checkpoint saving and resumption
+"""
+
 import os
+import sys
 import math
+import argparse
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 import shutil
+from typing import Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn import RMSNorm
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from accelerate import Accelerator
-from transformers import get_cosine_schedule_with_warmup
 
-# Ensure the official mamba-ssm library is installed
-try:
-    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
-except ImportError:
-    raise ImportError("Please install the official library: pip install mamba-ssm")
+# Import modular components from nexa package
+from nexa.config import (
+    NexaConfig,
+    Config,
+    get_unit_test_config,
+    get_dev_config,
+    get_base_config,
+    get_poc_config,
+)
+from nexa.model import NexaSLM, PerfectSLM, SuperBlock, count_parameters
+from nexa.mamba3 import Mamba3Layer, mamba3_trapezoidal_scan, mamba1_standard_scan
+from nexa.attention import SWGQA, apply_rotary_emb
+from nexa.moe import MoELayer, SwiGLU
+from nexa.scratchpad import VirtualScratchpad
+from nexa.data import MemmapDataset, validate_dataset, create_synthetic_dataset
 
-# ==========================================
-# 1. STATIC CONFIGURATION
-# ==========================================
-class Config:
-    # Model Specs
-    d_model = 512
-    n_super_blocks = 2  # Total 10 sub-layers
-    vocab_size = 32768
-    max_seq_len = 2048
-    num_scratchpad = 256
-    
-    # Mamba-3 Specs
-    mamba_expand = 2
-    mamba_d_state = 16
-    mamba_d_inner = d_model * mamba_expand
-    mamba_dt_rank = math.ceil(d_model / 16)
-    mamba_conv_size = 4
-    
-    # SW-GQA Specs
-    q_heads = 8
-    kv_heads = 2
-    head_dim = 64
-    window_size = 256
-    
-    # MoE Specs
-    num_experts = 8
-    num_active_experts = 2
-    moe_ffn_dim = 1024
-    router_aux_loss_coef = 0.01
-    router_z_loss_coef = 0.001
-    
-    # Training Specs (Tuned for ~1M Tokens per Global Step on 2 GPUs)
-    batch_size_per_gpu = 4               
-    gradient_accumulation_steps = 64       
-    max_lr = 3e-4                         
-    min_lr = 3e-5
-    weight_decay = 0.01
-    warmup_steps_pct = 0.10               
-    total_global_steps = 10000
-    eval_every = 50                       
-    save_latest_every = 20
-    eval_iters = 1000                      # Cap validation to 100 batches (~3 sec)
-    
-    # Dataset File Paths
-    train_bin = "/kaggle/input/datasets/ommahadeokar/dataandtok/train.bin"
-    val_bin = "/kaggle/input/datasets/ommahadeokar/dataandtok/val.bin"
-    
-    # SINGLE FILE CHECKPOINT OPTIONS:
-    checkpoint_dir = "checkpoints"
-    # Set to "best_model.pt", "latest_model.pt", or None
-    resume_from_checkpoint = None 
+# Fallback export of selective_scan_fn for legacy imports
+selective_scan_fn = mamba3_trapezoidal_scan
 
-# ==========================================
-# 2. DATASET (Memmap Loading)
-# ==========================================
-class MemmapDataset(Dataset):
-    def __init__(self, bin_path, seq_len):
-        if not os.path.exists(bin_path):
-            raise FileNotFoundError(f"{bin_path} missing. Generate it before training.")
-        self.data = np.memmap(bin_path, dtype=np.uint16, mode='r')
-        self.seq_len = seq_len
-        
-    def __len__(self):
-        return (len(self.data) - 1) // self.seq_len
-        
-    def __getitem__(self, idx):
-        start = idx * self.seq_len
-        end = start + self.seq_len + 1
-        chunk = torch.from_numpy((self.data[start:end]).astype(np.int64))
-        return chunk[:-1], chunk[1:]
 
 def cycle(loader):
-    """Infinite iterator to prevent StopIteration crashes across epochs in DDP"""
+    """Infinite iterator to prevent StopIteration crashes across epochs in DDP."""
     while True:
         for batch in loader:
             yield batch
 
-# ==========================================
-# 3. ARCHITECTURE COMPONENTS
-# ==========================================
-class SwiGLU(nn.Module):
-    def __init__(self, in_features, hidden_features):
-        super().__init__()
-        self.w1 = nn.Linear(in_features, hidden_features, bias=False)
-        self.w2 = nn.Linear(in_features, hidden_features, bias=False)
-        self.w3 = nn.Linear(hidden_features, in_features, bias=False)
-    def forward(self, x):
-        return self.w3(F.silu(self.w1(x)) * self.w2(x))
 
-class MoELayer(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.num_experts = config.num_experts
-        self.num_active = config.num_active_experts
-        self.router = nn.Linear(config.d_model, self.num_experts, bias=False)
-        self.experts = nn.ModuleList([SwiGLU(config.d_model, config.moe_ffn_dim) for _ in range(self.num_experts)])
-        self.shared_expert = SwiGLU(config.d_model, config.moe_ffn_dim)
-
-    def forward(self, x):
-        B, L, D = x.shape
-        shared_out = self.shared_expert(x)
-        
-        logits = self.router(x)
-        routing_weights = F.softmax(logits, dim=-1)
-        top_weights, top_indices = torch.topk(routing_weights, self.num_active, dim=-1)
-        top_weights = top_weights / top_weights.sum(dim=-1, keepdim=True)
-        
-        flat_x = x.view(-1, D)
-        flat_indices = top_indices.view(-1, self.num_active)
-        flat_weights = top_weights.view(-1, self.num_active)
-        flat_out = torch.zeros_like(flat_x)
-        
-        for i in range(self.num_experts):
-            expert_mask = (flat_indices == i)
-            if expert_mask.any():
-                token_idx, active_idx = torch.where(expert_mask)
-                expert_outputs = self.experts[i](flat_x[token_idx])
-                weights_i = flat_weights[token_idx, active_idx].unsqueeze(-1)
-                flat_out[token_idx] += expert_outputs * weights_i
-                
-        out = flat_out.view(B, L, D) + shared_out
-        
-        z_loss = torch.mean(torch.logsumexp(logits, dim=-1)**2)
-        expert_mask_oh = F.one_hot(top_indices, num_classes=self.num_experts).float()
-        expert_fraction = expert_mask_oh.mean(dim=(0, 1)).sum(dim=0)
-        routing_prob = routing_weights.mean(dim=(0, 1))
-        aux_loss = torch.sum(expert_fraction * routing_prob) * self.num_experts
-        
-        return out, z_loss, aux_loss
-
-class Mamba3Layer(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.d_inner = config.mamba_d_inner
-        self.d_state = config.mamba_d_state
-        
-        self.in_proj = nn.Linear(config.d_model, self.d_inner * 2, bias=False)
-        self.conv1d = nn.Conv1d(self.d_inner, self.d_inner, config.mamba_conv_size, groups=self.d_inner, padding=config.mamba_conv_size - 1)
-        self.x_proj = nn.Linear(self.d_inner, config.mamba_dt_rank + self.d_state * 2, bias=False)
-        self.dt_proj = nn.Linear(config.mamba_dt_rank, self.d_inner, bias=True)
-        
-        A = torch.arange(1, self.d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
-        self.A_log = nn.Parameter(torch.log(A))
-        self.D = nn.Parameter(torch.ones(self.d_inner))
-        self.out_proj = nn.Linear(self.d_inner, config.d_model, bias=False)
-
-    def forward(self, x):
-        B, L, _ = x.shape
-        xz = self.in_proj(x)
-        x_in, z = xz.chunk(2, dim=-1)
-        
-        x_conv = self.conv1d(x_in.transpose(1, 2))[:, :, :L]
-        x_conv = F.silu(x_conv)
-        
-        x_dbl = self.x_proj(x_conv.transpose(1, 2))
-        dt, B_proj, C_proj = torch.split(x_dbl, [Config.mamba_dt_rank, self.d_state, self.d_state], dim=-1)
-        dt = F.softplus(self.dt_proj(dt))
-        
-        A = -torch.exp(self.A_log.float())
-        
-        y = selective_scan_fn(
-            u=x_conv,
-            delta=dt.transpose(1, 2).to(x_conv.dtype),
-            A=A,
-            B=B_proj.transpose(1, 2),
-            C=C_proj.transpose(1, 2),
-            D=self.D.float(),
-            z=None,
-            delta_bias=None,
-            delta_softplus=False
+def get_cosine_schedule_with_min_lr(
+    optimizer: torch.optim.Optimizer,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    max_lr: float,
+    min_lr: float,
+):
+    """
+    Cosine learning rate schedule with linear warmup and min_lr floor.
+    Ensures that learning rate decays to min_lr instead of 0.0.
+    """
+    def lr_lambda(current_step: int):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        progress = float(current_step - num_warmup_steps) / float(
+            max(1, num_training_steps - num_warmup_steps)
         )
-        
-        y = y.transpose(1, 2)
-        return self.out_proj(y * F.silu(z))
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        # Scale between min_lr / max_lr and 1.0
+        min_ratio = min_lr / max_lr
+        return min_ratio + (1.0 - min_ratio) * cosine_decay
 
-def apply_rotary_emb(xq, xk, freqs_cos, freqs_sin):
-    xq_r, xq_i = xq.float().reshape(*xq.shape[:-1], -1, 2).unbind(-1)
-    xk_r, xk_i = xk.float().reshape(*xk.shape[:-1], -1, 2).unbind(-1)
-    
-    freqs_cos = freqs_cos.view(1, 1, xq.shape[2], xq.shape[3] // 2)
-    freqs_sin = freqs_sin.view(1, 1, xq.shape[2], xq.shape[3] // 2)
-    
-    xq_out_r = xq_r * freqs_cos - xq_i * freqs_sin
-    xq_out_i = xq_r * freqs_sin + xq_i * freqs_cos
-    xk_out_r = xk_r * freqs_cos - xk_i * freqs_sin
-    xk_out_i = xk_r * freqs_sin + xk_i * freqs_cos
-    
-    xq_out = torch.stack([xq_out_r, xq_out_i], dim=-1).flatten(3)
-    xk_out = torch.stack([xk_out_r, xk_out_i], dim=-1).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-class SWGQA(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.q_heads, self.kv_heads = config.q_heads, config.kv_heads
-        self.head_dim, self.window_size = config.head_dim, config.window_size
-        self.num_scratchpad = config.num_scratchpad
-        
-        self.q_proj = nn.Linear(config.d_model, self.q_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(config.d_model, self.kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(config.d_model, self.kv_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.q_heads * self.head_dim, config.d_model, bias=False)
-        
-        dim, end = self.head_dim, config.max_seq_len + self.num_scratchpad
-        freqs = 1.0 / (10000.0 ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-        t = torch.arange(end, dtype=torch.float32)
-        freqs = torch.outer(t, freqs).float()
-        self.register_buffer("freqs_cos", torch.cos(freqs))
-        self.register_buffer("freqs_sin", torch.sin(freqs))
-        
-    def forward(self, x):
-        B, L, D = x.shape
-        q = self.q_proj(x).view(B, L, self.q_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, L, self.kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, L, self.kv_heads, self.head_dim).transpose(1, 2)
-        
-        q, k = apply_rotary_emb(q, k, self.freqs_cos[:L], self.freqs_sin[:L])
-        
-        k = k.repeat_interleave(self.q_heads // self.kv_heads, dim=1)
-        v = v.repeat_interleave(self.q_heads // self.kv_heads, dim=1)
-        
-        mask_tril = torch.tril(torch.ones(L, L, dtype=torch.bool, device=x.device))
-        mask_sw = torch.triu(torch.ones(L, L, dtype=torch.bool, device=x.device), diagonal=-self.window_size + 1)
-        mask_scratchpad = torch.zeros(L, L, dtype=torch.bool, device=x.device)
-        mask_scratchpad[:, :self.num_scratchpad] = True
-        
-        valid_attend = mask_tril & (mask_sw | mask_scratchpad)
-        attn_bias = torch.zeros(L, L, device=x.device).masked_fill_(~valid_attend, float('-inf'))
-        
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        attn = F.softmax(scores + attn_bias.unsqueeze(0).unsqueeze(0), dim=-1)
-        
-        out = torch.matmul(attn, v).transpose(1, 2).contiguous().view(B, L, -1)
-        return self.o_proj(out)
 
-class SuperBlock(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.layers = nn.ModuleList()
-        for i in range(5):
-            if i == 2:
-                self.layers.append(nn.ModuleDict({
-                    'norm1': RMSNorm(config.d_model), 'attn': SWGQA(config),
-                    'norm2': RMSNorm(config.d_model), 'shared_mlp': SwiGLU(config.d_model, config.moe_ffn_dim)
-                }))
-            else:
-                self.layers.append(nn.ModuleDict({
-                    'norm1': RMSNorm(config.d_model), 'mamba': Mamba3Layer(config),
-                    'norm2': RMSNorm(config.d_model), 'moe': MoELayer(config)
-                }))
-                
-    def forward(self, x):
-        tot_z, tot_aux = 0.0, 0.0
-        for i, layer in enumerate(self.layers):
-            if i == 2:
-                x = x + layer['attn'](layer['norm1'](x))
-                x = x + layer['shared_mlp'](layer['norm2'](x))
-            else:
-                x = x + layer['mamba'](layer['norm1'](x))
-                moe_out, z, aux = layer['moe'](layer['norm2'](x))
-                x = x + moe_out
-                tot_z += z; tot_aux += aux
-        return x, tot_z, tot_aux
-
-class PerfectSLM(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.embedding = nn.Embedding(config.vocab_size, config.d_model)
-        self.scratchpad = nn.Parameter(torch.randn(config.num_scratchpad, config.d_model) * 0.02)
-        
-        self.blocks = nn.ModuleList([SuperBlock(config) for _ in range(config.n_super_blocks)])
-        self.norm = RMSNorm(config.d_model)
-        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-        self.lm_head.weight = self.embedding.weight 
-        
-        self.apply(self._init_weights)
-        
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        
-    def forward(self, x, targets=None):
-        B = x.size(0)
-        hidden = torch.cat([self.scratchpad.unsqueeze(0).expand(B, -1, -1), self.embedding(x)], dim=1)
-        
-        total_z_loss, total_aux_loss = 0.0, 0.0
-        for block in self.blocks:
-            hidden, z, aux = block(hidden)
-            total_z_loss += z; total_aux_loss += aux
-            
-        hidden = self.norm(hidden)[:, self.config.num_scratchpad:, :]
-        logits = self.lm_head(hidden)
-        
-        ce_loss = F.cross_entropy(logits.view(-1, self.config.vocab_size), targets.view(-1)) if targets is not None else None
-        return ce_loss, total_z_loss, total_aux_loss
-
-# ==========================================
-# 4. SINGLE-FILE CHECKPOINT HELPER FUNCTIONS
-# ==========================================
-def save_single_file_checkpoint(filepath, global_step, tokens_seen, best_val_loss, accelerator, model, optimizer, scheduler):
-    """Saves the model, optimizer, and training states into a single .pt file safely in DDP"""
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+def save_single_file_checkpoint(
+    filepath: str,
+    global_step: int,
+    tokens_seen: int,
+    best_val_loss: float,
+    accelerator: Accelerator,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    config: NexaConfig,
+):
+    """Saves model weights, optimizer, scheduler, and training states safely into a single .pt file."""
+    os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
     unwrapped_model = accelerator.unwrap_model(model)
-    
+
     checkpoint = {
-        'global_step': global_step,
-        'tokens_seen': tokens_seen,
-        'best_val_loss': best_val_loss,
-        'model_state_dict': unwrapped_model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
+        "global_step": global_step,
+        "tokens_seen": tokens_seen,
+        "best_val_loss": best_val_loss,
+        "model_state_dict": unwrapped_model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "config": vars(config),
+        "torch_rng_state": torch.get_rng_state(),
+        "np_rng_state": np.random.get_state(),
     }
-    # accelerator.save ensures only Rank 0 writes to disk
+    if torch.cuda.is_available():
+        checkpoint["cuda_rng_state"] = torch.cuda.get_rng_state_all()
+
     accelerator.save(checkpoint, filepath)
 
-# ==========================================
-# 5. TRAINING LOOP
-# ==========================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train NEXA-SLM")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="base",
+        choices=["poc", "base", "dev", "test"],
+        help="Configuration preset (poc: ~397M, base: ~149M, dev: ~42M, test: ~3M)",
+    )
+    parser.add_argument("--train_bin", type=str, default=None, help="Path to training uint16 .bin file")
+    parser.add_argument("--val_bin", type=str, default=None, help="Path to validation uint16 .bin file")
+    parser.add_argument("--batch_size", type=int, default=None, help="Micro-batch size per device")
+    parser.add_argument("--grad_accum", type=int, default=None, help="Gradient accumulation steps")
+    parser.add_argument("--max_lr", type=float, default=None, help="Maximum learning rate")
+    parser.add_argument("--min_lr", type=float, default=None, help="Minimum learning rate")
+    parser.add_argument("--steps", type=int, default=None, help="Total global training steps")
+    parser.add_argument("--eval_every", type=int, default=None, help="Evaluate every N global steps")
+    parser.add_argument("--save_latest_every", type=int, default=None, help="Save latest checkpoint every N global steps")
+    parser.add_argument("--eval_iters", type=int, default=None, help="Max validation batches to evaluate")
+    parser.add_argument("--mixed_precision", type=str, default=None, choices=["no", "fp16", "bf16"])
+    parser.add_argument("--checkpoint_dir", type=str, default=None, help="Checkpoint output directory")
+    parser.add_argument("--resume", type=str, default=None, help="Checkpoint file to resume from")
+    parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing")
+    parser.add_argument("--create_sample_data_if_missing", action="store_true", help="Auto-generate sample data if missing")
+    return parser.parse_args()
+
+
 def main():
-    config = Config()
-    
-    # 1. Copy dataset to fast local NVMe disk to prevent FUSE IO crashes
-    local_train = "/kaggle/working/local_train.bin"
-    if not os.path.exists(local_train) and os.path.exists(config.train_bin):
-        print("Copying 9.5GB dataset to local NVMe... (takes ~2 mins)")
-        shutil.copy(config.train_bin, local_train)
-        config.train_bin = local_train
+    args = parse_args()
+
+    # 1. Select base configuration preset
+    if args.config == "poc":
+        config = get_poc_config()
+    elif args.config == "dev":
+        config = get_dev_config()
+    elif args.config == "test":
+        config = get_unit_test_config()
+    else:
+        config = get_base_config()
+
+    # Override with CLI arguments if provided
+    if args.train_bin is not None:
+        config.train_bin = args.train_bin
+    if args.val_bin is not None:
+        config.val_bin = args.val_bin
+    if args.batch_size is not None:
+        config.batch_size_per_gpu = args.batch_size
+    if args.grad_accum is not None:
+        config.gradient_accumulation_steps = args.grad_accum
+    if args.max_lr is not None:
+        config.max_lr = args.max_lr
+    if args.min_lr is not None:
+        config.min_lr = args.min_lr
+    if args.steps is not None:
+        config.total_global_steps = args.steps
+    if args.eval_every is not None:
+        config.eval_every = args.eval_every
+    if args.eval_iters is not None:
+        config.eval_iters = args.eval_iters
+    if args.checkpoint_dir is not None:
+        config.checkpoint_dir = args.checkpoint_dir
+    if args.resume is not None:
+        config.resume_from_checkpoint = args.resume
+
+    # Hardware & precision adaptability
+    if args.mixed_precision is not None:
+        mixed_precision = args.mixed_precision
+    else:
+        mixed_precision = "fp16" if torch.cuda.is_available() else "no"
 
     accelerator = Accelerator(
-        mixed_precision='fp16', 
-        gradient_accumulation_steps=config.gradient_accumulation_steps
+        mixed_precision=mixed_precision,
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
     )
-    
-    train_loader = DataLoader(MemmapDataset(config.train_bin, config.max_seq_len), batch_size=config.batch_size_per_gpu, shuffle=True, drop_last=True)
-    val_loader = DataLoader(MemmapDataset(config.val_bin, config.max_seq_len), batch_size=config.batch_size_per_gpu, shuffle=False)
-    
+
+    accelerator.print("=" * 75)
+    accelerator.print(f"  NEXA-SLM Master Training Pipeline (Preset: {args.config.upper()})")
+    accelerator.print(f"  Device: {accelerator.device} | Processes: {accelerator.num_processes} | Mixed Precision: {mixed_precision}")
+    accelerator.print("=" * 75)
+
+    # 2. Check and prepare datasets
+    if not os.path.exists(config.train_bin) or not os.path.exists(config.val_bin):
+        if args.create_sample_data_if_missing or not os.path.exists(config.train_bin):
+            accelerator.print(f"Dataset files not found at '{config.train_bin}'. Generating sample dataset...")
+            os.makedirs(os.path.dirname(os.path.abspath(config.train_bin)), exist_ok=True)
+            create_synthetic_dataset(config.train_bin, num_tokens=100000, vocab_size=config.vocab_size)
+            create_synthetic_dataset(config.val_bin, num_tokens=20000, vocab_size=config.vocab_size, seed=123)
+            accelerator.print("Sample datasets generated successfully.")
+
+    train_val = validate_dataset(config.train_bin, config.vocab_size)
+    if not train_val["valid"]:
+        raise ValueError(f"Training dataset validation failed: {train_val.get('error')}")
+
+    val_val = validate_dataset(config.val_bin, config.vocab_size)
+    if not val_val["valid"]:
+        raise ValueError(f"Validation dataset validation failed: {val_val.get('error')}")
+
+    accelerator.print(f"Train Dataset: {config.train_bin} ({train_val['num_tokens']:,} tokens, {train_val['file_size_mb']} MB)")
+    accelerator.print(f"Val Dataset:   {config.val_bin} ({val_val['num_tokens']:,} tokens, {val_val['file_size_mb']} MB)")
+
+    # 3. Model construction
     model = PerfectSLM(config)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.max_lr, weight_decay=config.weight_decay)
-    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=int(config.warmup_steps_pct * config.total_global_steps), num_training_steps=config.total_global_steps)
-    
-    model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(model, optimizer, train_loader, val_loader, scheduler)
-    
-    # -------------------------------------------------------------
-    # RESUME FROM SINGLE CHECKPOINT FILE
-    # -------------------------------------------------------------
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+        accelerator.print("Activation Checkpointing: ENABLED")
+
+    param_info = count_parameters(model, config)
+    accelerator.print(f"Total Trainable Parameters: {param_info['total_trainable'] / 1e6:,.2f} M")
+    accelerator.print(f"Active Parameters / Token:  {param_info['active_params_per_token'] / 1e6:,.2f} M")
+    accelerator.print(f"Checkpoint Sizes: {param_info['checkpoint_sizes_mb']}")
+
+    # 4. DataLoaders
+    train_dataset = MemmapDataset(config.train_bin, config.max_seq_len, config.vocab_size)
+    val_dataset = MemmapDataset(config.val_bin, config.max_seq_len, config.vocab_size)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.batch_size_per_gpu,
+        shuffle=True,
+        drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.batch_size_per_gpu,
+        shuffle=False,
+    )
+
+    # 5. Optimizer & Scheduler
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.max_lr,
+        weight_decay=config.weight_decay,
+    )
+    warmup_steps = int(config.warmup_steps_pct * config.total_global_steps)
+    scheduler = get_cosine_schedule_with_min_lr(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=config.total_global_steps,
+        max_lr=config.max_lr,
+        min_lr=config.min_lr,
+    )
+
+    model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
+        model, optimizer, train_loader, val_loader, scheduler
+    )
+
+    # 6. Checkpoint resumption if requested
     global_step = 0
     tokens_seen = 0
-    best_val_loss = float('inf')
-    
+    best_val_loss = float("inf")
+
     if config.resume_from_checkpoint:
         ckpt_path = os.path.join(config.checkpoint_dir, config.resume_from_checkpoint)
         if os.path.exists(ckpt_path):
-            checkpoint = torch.load(ckpt_path, map_location='cpu')
-            
-            # Load model state dict
-            unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.load_state_dict(checkpoint['model_state_dict'])
-            unwrapped_model.lm_head.weight = unwrapped_model.embedding.weight  # Re-tie weights
-            
-            # Load optimizer & scheduler
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            
-            # Load step state
-            global_step = checkpoint['global_step']
-            tokens_seen = checkpoint['tokens_seen']
-            best_val_loss = checkpoint['best_val_loss']
-            accelerator.print(f"✅ Successfully Resumed from single-file: {ckpt_path} (Global Step {global_step})")
-        else:
-            accelerator.print(f"⚠️ Checkpoint file {ckpt_path} not found. Starting from scratch.")
+            checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            unwrapped = accelerator.unwrap_model(model)
+            unwrapped.load_state_dict(checkpoint["model_state_dict"])
+            if config.tie_embeddings:
+                unwrapped.lm_head.weight = unwrapped.embedding.weight
 
-    # -------------------------------------------------------------
-    # MASTER TRAINING LOOP
-    # -------------------------------------------------------------
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            global_step = checkpoint.get("global_step", 0)
+            tokens_seen = checkpoint.get("tokens_seen", 0)
+            best_val_loss = checkpoint.get("best_val_loss", float("inf"))
+            accelerator.print(f"Resumed from {ckpt_path} at Global Step {global_step}")
+        else:
+            accelerator.print(f"Warning: Checkpoint {ckpt_path} not found. Starting from scratch.")
+
+    # 7. Master Training Loop
     model.train()
     border = "-" * 115
     accelerator.print(f"\n{border}")
-    accelerator.print(f"| {'Type':^12} | {'Global Step':^11} | {'CE Loss':^10} | {'Z-Loss':^10} | {'Aux Loss':^10} | {'Total Loss':^11} | {'Tokens Seen':^15} |")
-    accelerator.print(f"{border}")
+    accelerator.print(
+        f"| {'Type':^12} | {'Global Step':^11} | {'CE Loss':^10} | {'Z-Loss':^10} | "
+        f"{'Aux Loss':^10} | {'Total Loss':^11} | {'Tokens Seen':^15} |"
+    )
+    accelerator.print(border)
 
     train_iter = cycle(train_loader)
-    
+
     while global_step < config.total_global_steps:
+        accum_ce, accum_z, accum_aux, accum_total = 0.0, 0.0, 0.0, 0.0
+
         for micro_step in range(config.gradient_accumulation_steps):
             x, y = next(train_iter)
-            
+
             with accelerator.accumulate(model):
                 ce_loss, z_loss, aux_loss = model(x, y)
-                total_loss = ce_loss + (config.router_z_loss_coef * z_loss) + (config.router_aux_loss_coef * aux_loss)
-                
+                total_loss = (
+                    ce_loss
+                    + (config.router_z_loss_coef * z_loss)
+                    + (config.router_aux_loss_coef * aux_loss)
+                )
+
                 accelerator.backward(total_loss)
-                
+
                 if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
-                
-            tokens_seen += x.numel() * accelerator.num_processes
-            lr = scheduler.get_last_lr()[0]
-            
-            accelerator.print(f"| {'Micro ' + str(micro_step):<12} | {global_step + 1:11,d} | {ce_loss.item():10.4f} | {z_loss.item():10.4f} | {aux_loss.item():10.4f} | {total_loss.item():11.4f} | {tokens_seen:15,d} |")
-            
-        global_step += 1
-        
-        accelerator.print(f"| {'[ GLOBAL ]':<12} | {global_step:11,d} | {ce_loss.item():10.4f} | {z_loss.item():10.4f} | {aux_loss.item():10.4f} | {total_loss.item():11.4f} | {tokens_seen:15,d} |\n{border}")
 
-        # Evaluation & Best Checkpoint (Single File)
+            accum_ce += ce_loss.item()
+            accum_z += z_loss.item()
+            accum_aux += aux_loss.item()
+            accum_total += total_loss.item()
+            tokens_seen += x.numel() * accelerator.num_processes
+
+        global_step += 1
+        n_accum = config.gradient_accumulation_steps
+        avg_ce = accum_ce / n_accum
+        avg_z = accum_z / n_accum
+        avg_aux = accum_aux / n_accum
+        avg_tot = accum_total / n_accum
+
+        current_lr = scheduler.get_last_lr()[0]
+        accelerator.print(
+            f"| {'[ STEP ]':<12} | {global_step:11,d} | {avg_ce:10.4f} | {avg_z:10.4f} | "
+            f"{avg_aux:10.4f} | {avg_tot:11.4f} | {tokens_seen:15,d} | LR: {current_lr:.2e}"
+        )
+
+        # Evaluation
         if global_step % config.eval_every == 0:
             model.eval()
             val_loss = 0.0
-            
+            batches_evaluated = 0
+
             with torch.no_grad():
                 for i, (vx, vy) in enumerate(val_loader):
                     if i >= config.eval_iters:
                         break
                     v_ce, _, _ = model(vx, vy)
                     val_loss += accelerator.gather(v_ce).mean().item()
-                    
-            val_loss /= config.eval_iters
-            accelerator.print(f"🌟 [VALIDATION] Global Step {global_step} | Val Loss: {val_loss:.4f} | Best Loss: {best_val_loss:.4f}")
-            
+                    batches_evaluated += 1
+
+            if batches_evaluated > 0:
+                val_loss /= batches_evaluated
+            val_ppl = math.exp(min(20.0, val_loss))
+
+            accelerator.print(
+                f">> [EVAL] Global Step {global_step} | Val Loss: {val_loss:.4f} | "
+                f"Val PPL: {val_ppl:.2f} | Best Val Loss: {best_val_loss:.4f}"
+            )
+
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_path = os.path.join(config.checkpoint_dir, "best_model.pt")
-                save_single_file_checkpoint(best_path, global_step, tokens_seen, best_val_loss, accelerator, model, optimizer, scheduler)
-                accelerator.print(f"🚀 New Best Single-File Checkpoint Saved to {best_path}!")
-                
+                save_single_file_checkpoint(
+                    best_path,
+                    global_step,
+                    tokens_seen,
+                    best_val_loss,
+                    accelerator,
+                    model,
+                    optimizer,
+                    scheduler,
+                    config,
+                )
+                accelerator.print(f"** Saved New Best Checkpoint -> {best_path}")
+
             accelerator.print(border)
             model.train()
 
-        # Save Latest Checkpoint (Single File)
+        # Save Latest Checkpoint
         if global_step % config.save_latest_every == 0:
             latest_path = os.path.join(config.checkpoint_dir, "latest_model.pt")
-            save_single_file_checkpoint(latest_path, global_step, tokens_seen, best_val_loss, accelerator, model, optimizer, scheduler)
-            accelerator.print(f"💾 Latest Single-File Checkpoint Saved to {latest_path} at Step {global_step}")
-            accelerator.print(border)
+            save_single_file_checkpoint(
+                latest_path,
+                global_step,
+                tokens_seen,
+                best_val_loss,
+                accelerator,
+                model,
+                optimizer,
+                scheduler,
+                config,
+            )
+            accelerator.print(f"-- Saved Latest Checkpoint -> {latest_path} at Step {global_step}")
+
+    accelerator.print("\nTraining completed successfully!")
+
 
 if __name__ == "__main__":
     main()
