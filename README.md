@@ -63,7 +63,6 @@ docs/                     Architecture, development, and experiment notes
 research/                 Research paper information
 CONTRIBUTING.md           Collaboration guidelines
 .gitignore                Ignore rules for environments, data, and checkpoints
-LICENSE                   Project license
 README.md                 Project overview
 ```
 
@@ -88,6 +87,10 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/DEVELOPMENT.md](docs/DEVELOPME
 ## Research limitations
 
 The paper identifies the POC as not yet empirically validated. Its analytical memory estimates exclude activations, SSM states, and runtime overhead. Sparse routing reduces active compute but does not eliminate resident expert-weight memory. Scratchpad memory does not guarantee exact recall of all distant facts. CPU/embedded kernels and INT8/INT4 behavior require separate validation.
+
+## License status
+
+No license has been selected yet. Because the research paper lists multiple authors, confirm the software and research-artifact licensing terms with all relevant rights holders before adding a license or redistributing the paper, code, or weights. Until then, do not assume this public repository grants general reuse rights; grant trusted collaborators repository access or have them submit fork-based pull requests.
 
 ## Acknowledgement
 
