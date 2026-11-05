@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+
+# Environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Notebooks / tooling
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs and experiment outputs
+*.log
+logs/
+runs/
+wandb/
+mlruns/
+tensorboard/
+outputs/
+
+# Model weights / checkpoints (use approved artifact storage or Git LFS)
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+*.gguf
+checkpoints/
+models/
+
+# Local data (track only small, approved samples intentionally)
+data/
+datasets/
+
+# Secrets / local configuration
+.env
+.env.*
+!.env.example
+secrets.*
