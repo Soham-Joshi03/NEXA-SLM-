@@ -80,6 +80,14 @@ git switch -c feature/your-change
 
 Before claiming support for a device or precision, validate it and document the exact configuration and measurements.
 
+## Current implementation files
+
+- `inference.py`: token-by-token autoregressive generation with cached Mamba and SW-GQA states, sampling, and an execution example.
+- `tokenizer/`: the supplied ByteLevel BPE tokenizer JSON, stored in two consecutive parts to preserve the original data.
+- `scripts/assemble_tokenizer.py`: reconstructs and validates the root-level `jamba_bbpe_tokenizer.json` expected by the inference script.
+
+Before running inference, execute `python scripts/assemble_tokenizer.py`. **The inference script also imports model definitions from `train.py`, which has not yet been uploaded; inference is not runnable from this repository alone until that module and a compatible checkpoint are added.** See [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md).
+
 ## Collaboration
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md). Work on feature branches and submit pull requests to `main`; keep commits focused and include tests and reproducibility information.
