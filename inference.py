@@ -94,19 +94,34 @@ def load_model_for_inference(
     Constructs model, loads checkpoint if available, and applies optional INT8 quantization.
     Returns (model, is_trained).
     """
-    model = PerfectSLM(config)
     is_trained = False
 
     if checkpoint_path and os.path.exists(checkpoint_path):
         print(f"Loading checkpoint from: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
-        model.load_state_dict(state_dict, strict=True)
+
+        # Auto-detect Mamba discretization from x_proj weight shape
+        for k, v in state_dict.items():
+            if "mamba.x_proj.weight" in k:
+                euler_dim = config.mamba_dt_rank + config.mamba_d_state * 2
+                if v.shape[0] == euler_dim:
+                    config.use_mamba3_trapezoidal = False
+                break
+
+        model = PerfectSLM(config)
+
+        # Scratchpad alias compatibility
+        if "scratchpad" in state_dict and "scratchpad_manager.scratchpad" not in state_dict:
+            state_dict["scratchpad_manager.scratchpad"] = state_dict["scratchpad"]
+
+        model.load_state_dict(state_dict, strict=False)
         is_trained = True
         step = checkpoint.get("global_step", "N/A")
         loss = checkpoint.get("best_val_loss", "N/A")
         print(f"Checkpoint loaded successfully! (Global Step: {step}, Best Val Loss: {loss})")
     else:
+        model = PerfectSLM(config)
         if checkpoint_path:
             print(f"Warning: Checkpoint '{checkpoint_path}' not found.")
         print("[NOTICE: Generating with initialized (untrained) weights for architecture validation]")
