@@ -82,11 +82,13 @@ Before claiming support for a device or precision, validate it and document the 
 
 ## Current implementation files
 
+- `train.py`: the uploaded training script, including model definitions (`Config`, `Mamba3Layer`, `SWGQA`, `MoELayer`, `SuperBlock`, and `PerfectSLM`), memmap dataset loader, checkpoint helpers, and Accelerate-based training loop.
+
 - `inference.py`: token-by-token autoregressive generation with cached Mamba and SW-GQA states, sampling, and an execution example.
 - `tokenizer/`: the supplied ByteLevel BPE tokenizer JSON, stored in two consecutive parts to preserve the original data.
 - `scripts/assemble_tokenizer.py`: reconstructs and validates the root-level `jamba_bbpe_tokenizer.json` expected by the inference script.
 
-Before running inference, execute `python scripts/assemble_tokenizer.py`. **The inference script also imports model definitions from `train.py`, which has not yet been uploaded; inference is not runnable from this repository alone until that module and a compatible checkpoint are added.** See [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md).
+Before running inference, execute `python scripts/assemble_tokenizer.py`. **The inference script's `train.py` model-definition dependency is now included. A compatible trained checkpoint and the required Python/CUDA dependencies are still needed to run inference.** See [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md).
 
 ## Collaboration
 
